@@ -1,0 +1,17 @@
+# 环境变量文件
+.env
+ai-env/
+*env/
+.vscode
+
+# Python字节码缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Locust 压测结果文件
+tests/result_*.csv
+
+docs/rag/test_set.json
+examples/rag_store.json
