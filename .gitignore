@@ -1,6 +1,7 @@
 # 环境变量文件
 .env
 ai-env/
+ai*nv/
 *env/
 .vscode
 
@@ -15,3 +16,5 @@ tests/result_*.csv
 
 docs/rag/test_set.json
 examples/rag_store.json
+
+vector_db/
