@@ -18,3 +18,7 @@ docs/rag/test_set.json
 examples/rag_store.json
 
 vector_db/
+
+# 日志目录（轮转文件不入库）
+logs/
+docs/

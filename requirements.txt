@@ -1,0 +1,35 @@
+# E:\rag-knowledge-platform 验证通过的依赖集合（Day18）
+# 由 2026-11-02 实际安装版本生成，注意：不要在 Windows 上装 paddlepaddle 2.6.2，
+# 它会把 protobuf 钉在 <=3.20.2，与 chromadb / pymilvus 要求的 >=6.33.5 冲突。
+# 全量快照：python -m pip freeze > requirements-freeze.txt
+
+fastapi==0.162.0  # Web 层
+uvicorn==0.54.0  # Web 层
+pydantic==2.14.1  # Web 层
+python-dotenv==1.2.3  # 配置
+langchain==1.4.6  # RAG 框架
+langchain-core==1.6.12  # RAG 框架
+langchain-community==0.4.2  # RAG 框架
+langchain-chroma==1.1.0  # 向量库适配
+langchain-milvus==0.4.0  # 向量库适配
+langchain-openai==1.7.2  # LLM/Embedding 适配
+chromadb==1.5.9  # 向量库
+pymilvus==3.0.2  # 向量库
+sentence-transformers==6.1.0  # Embedding(BGE)
+torch==2.14.0  # Embedding 后端
+numpy==1.26.4  # 数值基础
+opencv-python==4.8.1.78  # 图像处理
+protobuf==7.36.2  # gRPC/OTel 基础（>=6.33.5 才能与 chromadb/pymilvus 共存）
+PyMuPDF==1.20.2  # PDF 解析
+pdfplumber==0.11.10  # PDF 解析
+pypdf==6.21.1  # PDF 解析
+python-docx==1.2.0  # DOCX 解析
+openpyxl==3.1.5  # XLSX 解析
+python-pptx==1.0.2  # PPTX 解析
+rapidocr-onnxruntime==1.4.4  # OCR 兜底（原 PaddleOCR 已移除）
+onnxruntime==1.23.2  # OCR 后端
+
+# 以下为可选依赖，不装不影响主链路：
+# xlwings 仅用于「xlsx 样式表损坏时用本机 Excel 另存修复」，需 Windows + Office；
+# 代码里是惰性导入，缺失时该分支会返回明确的 400 提示。
+# xlwings==0.37.0
