@@ -19,10 +19,16 @@ from app.core.exceptions import KbNotFoundError, KbStorageError, RAGBaseError
 from app.services.model_factory import ModelFactory
 from utils.logger import get_logger
 
-# 向量库持久化目录：与 examples/ 保持同一份库，避免出现两套库
+# 向量库持久化目录：默认与 examples/ 保持同一份库，避免出现两套库
 # __file__ = app/services/index_service.py -> 上三级就是项目根目录
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-PERSIST_DIR = os.path.join(PROJECT_ROOT, "vector_db", "chroma_rag_db")
+# Docker 部署时用 CHROMA_PERSIST_DIR 指向挂载卷（docker-compose 里
+# ./chroma_data:/app/chroma_data 对应 CHROMA_PERSIST_DIR=/app/chroma_data），
+# 容器重启/删除重建后向量数据仍在宿主机；本地开发不设该变量，走默认路径。
+# （model_factory 在本模块顶部被导入时已执行 load_dotenv，写在 .env 里也生效）
+PERSIST_DIR = os.environ.get("CHROMA_PERSIST_DIR") or os.path.join(
+    PROJECT_ROOT, "vector_db", "chroma_rag_db"
+)
 
 # 巡检接口扫描 metadata 时的分页大小：只累积统计量、不保留原始行，避免大库一次性拉全量
 _INSPECT_PAGE = 1000
