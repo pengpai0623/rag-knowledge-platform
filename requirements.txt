@@ -28,6 +28,7 @@ openpyxl==3.1.5  # XLSX 解析
 python-pptx==1.0.2  # PPTX 解析
 rapidocr-onnxruntime==1.4.4  # OCR 兜底（原 PaddleOCR 已移除）
 onnxruntime==1.23.2  # OCR 后端
+python-multipart==0.0.32 # FastAPI文件上传依赖
 
 # 以下为可选依赖，不装不影响主链路：
 # xlwings 仅用于「xlsx 样式表损坏时用本机 Excel 另存修复」，需 Windows + Office；
