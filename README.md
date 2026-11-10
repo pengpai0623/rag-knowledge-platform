@@ -12,7 +12,7 @@
 - **多格式文档解析**：`.pdf` `.docx` `.xlsx` `.pptx` `.md` `.txt`，统一输出 LangChain `Document`
 - **PDF 智能降级**：文本层优先，乱码页用 pdfplumber 复核，扫描页走 OCR，空白页跳过；解析失败整单不入库
 - **文本清洗 + 分片**：去噪声、中文规范化、去重；按文档结构切分（docx 按标题聚合成小节、PDF 按页、pptx 按幻灯片），超长再递归切分（chunk 800 / overlap 100），无结构文档退回纯递归切分
-- **多知识库**：一个 Chroma collection 即一个知识库，接口用 `knowledge_base` 参数隔离
+- **一份文件一个知识库**：collection 名由文件内容决定（`doc_<sha256 前 16 位>`），后端生成、不可修改；每个知识库带一个后端生成的 `knowledge_base_id`（落进分片 metadata，供业务表/MySQL 关联）
 - **两种检索策略**：`similarity`（余弦相似度 + 阈值过滤，默认）/ `mmr`（多样性优先）
 - **答案带引用**：返回去重后的来源列表（文件名 + 页码），支持 SSE 流式输出
 - **可运维**：统一日志（控制台 + 轮转文件）、`request_id` 全链路串联、按来源删除向量
@@ -140,15 +140,28 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查 |
-| POST | `/api/rag/upload` | 上传文档并入库，参数 `knowledge_base`、`mode=replace\|skip`、`clean_policy=full\|safe\|raw` |
-| GET | `/api/rag/knowledge-bases` | 列出知识库及其文档数、分片数 |
+| POST | `/api/rag/upload` | 上传文档并入库，只收 `clean_policy=full\|safe\|raw`；库名与 `knowledge_base_id` 由后端生成，返回 `created\|skipped\|replaced` |
+| GET | `/api/rag/knowledge-bases` | 列出知识库（库名、来源文件名、`knowledge_base_id`）及分片数 |
 | GET | `/api/rag/collections` | 巡检：每个 collection 的 metadata 及内部 source 分布、解析版本（排障用，可选 `knowledge_base` 过滤） |
-| DELETE | `/api/rag/documents` | 按 `knowledge_base` + `source` 删除该文档全部向量 |
-| DELETE | `/api/rag/knowledge-bases/{name}` | 清空整个知识库（策略升级后整库重灌用） |
+| DELETE | `/api/rag/documents` | 按 `knowledge_base` + `source` 删除该文档全部向量（一库一文件后基本等价整库删除） |
+| DELETE | `/api/rag/knowledge-bases/{name}` | 删除整个知识库，响应带回 `knowledge_base_id` 与删除的分片数 |
 | POST | `/api/rag/chat` | 检索 + 生成，支持非流式与 SSE 流式 |
 
-上传默认 `mode=replace`：同一来源（文件名）先写新分片再删旧分片，重复上传不会让向量累加；
-`mode=skip` 则按文件 sha256 + `parser_version` + `clean_policy` 判重，库里已有同内容同策略时直接返回 `status=skipped`。
+上传不需要调用方判断「该不该入库」，也不传库名与模式，后端按库内状态三选一：
+
+| 状态 | 触发条件 | 行为 |
+|---|---|---|
+| `created` | 库不存在，或空库（上次写入失败的残留） | 生成新的 `knowledge_base_id`，解析后写入 |
+| `skipped` | 库存在，且 `parser_version` + `clean_policy` + `cleaner_version` + `splitter_version` 全一致 | 不解析、不 embed，直接返回库里的 `kb_id` 与分片数；**文件名变了会顺手刷新库内 `source`**（只改 metadata，不动向量） |
+| `replaced` | 库存在，但上面四项任一不一致 | 复用 `kb_id`，整库重建（先删后写），`deleted_chunks` 如实上报 |
+
+`skipped` 为什么还要写一次：判定只比「内容 + 策略」，源文件名不参与，所以改名重传会走 `skipped`。
+若不刷新 `source`，引用展示和按来源删除会一直停在第一次入库时的名字；而重算整库 embedding
+只为改一个字段并不划算。`collection.update` 一次写回全部分片的 metadata，耗时与分片数线性相关，
+不经过模型。响应里的 `source` 恒为**库内实际生效**的名字。
+
+因为库名就是内容 sha256，**改了内容重传会落到新库（新 `kb_id`）**，旧库不会被自动删除——响应里的
+`same_source_kbs` 会列出同文件名的其它历史库，由业务侧决定是否清理（自动按文件名删会误伤别人的同名文件）。
 
 `clean_policy` 手动选择清洗强度（默认 `full`，即历史行为）：
 
@@ -158,30 +171,52 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | `safe` | 保留 | 保留 | 保留 1 个 | 是 | 全量 | markdown、含缩进或空格对齐的文档 |
 | `raw` | 保留 | 保留 | 保留 | 否 | 仅去不可见字符 | 代码块、公式、ASCII 图表 |
 
-策略会写进分片 metadata 的 `clean_policy`，并在响应体回显（传错位置时能立刻发现，`clean_policy` 必须放在 query string，放进 form 会被静默忽略）。换策略重传同一份文件时 `mode=skip` 不会误跳过。
+策略会写进分片 metadata 的 `clean_policy`，并在响应体回显（`clean_policy` 必须放在 query string，放进 form 会被静默忽略）。
+同一个库换了策略重传会判成 `replaced`（整库重灌），响应里的 `clean_policy` 回显的是**库内实际生效**的值。
+
+除策略名外还有三个「策略指纹」，都是**改行为就要手工 +1** 的常量，写进每个分片并参与上述判定：
+
+| 常量 | 位置 | 什么时候改 |
+|---|---|---|
+| `PARSER_VERSION` | `utils/universal_parser.py` | 改了 docx/pdf/ocr 的抽取逻辑与产出顺序 |
+| `CLEANER_VERSION` | `utils/text_cleaner.py` | 改了清洗规则（正则、全角转换、缩进、去重），档位名不变也要改 |
+| `SPLITTER_VERSION` | `utils/structural_splitter.py` | 改了分片的分组/合并/校形规则 |
+
+漏改的后果是「改了代码却判 `skipped`」：旧切片继续被检索，新逻辑看似生效其实没进库。之所以用常量而不是
+文件内容哈希：哈希会被注释、空行和 CRLF/LF 换行影响，Windows 开发 + Linux 部署下同一份代码指纹不同，
+会让同一文件换个环境就整库重灌。
 
 ### 示例
 
-上传文档：
+上传文档（不传库名，返回体里的 `knowledge_base` 就是后续 chat/delete 要用的名字）：
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/api/rag/upload?knowledge_base=demo" \
+curl -X POST "http://127.0.0.1:8000/api/rag/upload" \
      -F "file=@docs/rag/UN38.3.pdf"
+```
+
+```json
+{ "code": 0, "data": {
+    "knowledge_base": "doc_4f2a9c7e1b3d5806", "knowledge_base_id": 1731273600123,
+    "status": "created", "source": "UN38.3.pdf", "chunk_count": 12, "deleted_chunks": 0,
+    "clean_policy": "full", "cleaner_version": "c1",
+    "parser_version": "v3", "splitter_version": "s1",
+    "reason": "首次入库", "same_source_kbs": [] } }
 ```
 
 markdown 或含缩进/表格的文档，用 `safe` 保住排版：
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/api/rag/upload?knowledge_base=demo&clean_policy=safe" \
+curl -X POST "http://127.0.0.1:8000/api/rag/upload?clean_policy=safe" \
      -F "file=@docs/rag/doc_parser_fallback_design_v1.1.md"
 ```
 
-问答（非流式）：
+问答（非流式，`knowledge_base` 用上一步返回值）：
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/api/rag/chat" \
      -H "Content-Type: application/json" \
-     -d '{"question":"这份报告讲了什么？","knowledge_base":"demo","top_k":4}'
+     -d '{"question":"这份报告讲了什么？","knowledge_base":"doc_4f2a9c7e1b3d5806","top_k":4}'
 ```
 
 流式请求把 `"stream": true` 打开即可，返回 SSE 事件：先 `sources`，再连续 `delta`，最后 `[DONE]`。
@@ -243,16 +278,18 @@ SSE 流式接口是唯一例外：流式响应不包此结构体，流内错误�
               → OCR 预算校验（超限立即失败）
               → 执行（文本页 / pdfplumber 复核 / 扫描页 OCR / 图表页 OCR / 空白跳过）
          Office：按段落、工作表、幻灯片拆分
-     → TextCleaner 清洗 → RecursiveCharacterTextSplitter 分片
-     → Chroma 入库（collection = knowledge_base，先写新分片再删同来源/同内容旧分片）
+     → TextCleaner 清洗 → 结构分片（标题聚合 / 按页 / 按幻灯片）
+     → 判定 created/skipped/replaced（比 parser_version + clean_policy + cleaner_version + splitter_version）
+     → Chroma 入库（collection = doc_<sha256 前16位>，分片带 knowledge_base_id；replaced 先删后写）
 
 问答 → 校验知识库存在 → 召回 top_k 片段（similarity 阈值过滤 / mmr 重排）
      → Prompt 拼装（带 [1][2] 编号与来源标注）
      → LLM 生成答案 + 去重来源列表
 ```
 
-解析后每个分片都带 `parser_version`、`file_sha256`、`parse_mode`、`layout_type`、`doc_parse_mode`，
-可据此判断「这一片来自文本层还是 OCR」「是哪个版本解析器产出的」，便于定向重灌。
+解析后每个分片都带 `parser_version`、`clean_policy`、`cleaner_version`、`splitter_version`、
+`file_sha256`、`parse_mode`、`layout_type`、`doc_parse_mode`，可据此判断「这一片来自文本层还是 OCR」
+「是哪个版本的解析/清洗/切分产出的」，便于定向重灌。
 
 **错误约定**：所有错误经全局异常体系返回统一结构体。业务类错误（文档损坏 / 加密 / OCR 失败 / 知识库不存在 /
 模型失败）一律 **HTTP 200 + 业务码**（1xxx / 2xxx / 3xxx）；参数校验失败 200 + code 422 + 逐字段明细；
@@ -266,11 +303,19 @@ SSE 流式接口是唯一例外：流式响应不包此结构体，流内错误�
 ## 测试与验收
 
 ```bash
+# 全部单测（12 个脚本，含 109+ 条断言；均不联网，不加载 Embedding 模型）
+for f in tests/test_*.py; do python "$f"; done
+
 # 页级判定单测（合成 PDF，不联网、不跑 OCR）
 python tests/test_pdf_probe.py
 
 # 全局异常四层分发与统一响应体（不联网；覆盖 200/404/405/413/500）
 python tests/test_error_handling.py
+
+# 行为快照：解析 / 清洗 / 分片对固定输入的产出逐字比对（版本号纪律的兜底）
+python tests/test_snapshot_behavior.py
+# 有意改动后重新生成快照（生成后务必 git diff tests/snapshots/ 逐行确认）
+UPDATE_SNAPSHOTS=1 python tests/test_snapshot_behavior.py
 
 # 召回验收：从库里抽样分片，用原文自召回，看 Recall@k / MRR
 python scripts/eval_recall.py --kb demo --auto 20

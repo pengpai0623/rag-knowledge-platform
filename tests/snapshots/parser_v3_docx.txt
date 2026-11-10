@@ -1,0 +1,24 @@
+docs=7
+
+[0] heading_level=1 is_heading=True layout_type=text parse_mode=docx chars=4
+产品手册
+
+[1] heading_level=2 is_heading=True layout_type=text parse_mode=docx chars=6
+第一章 概述
+
+[2] heading_level=None is_heading=False layout_type=text parse_mode=docx chars=13
+本手册介绍产品的基本用法。
+
+[3] heading_level=None is_heading=None layout_type=text parse_mode=docx chars=23
+表格_0:
+参数 | 取值
+电压 | 220V
+
+[4] heading_level=None is_heading=False layout_type=text parse_mode=docx chars=29
+表格之后的一段正文，用来验证表格是否回到正文中的真实位置。
+
+[5] heading_level=2 is_heading=True layout_type=text parse_mode=docx chars=6
+第二章 安装
+
+[6] heading_level=None is_heading=False layout_type=text parse_mode=docx chars=12
+双击安装包，按提示完成。

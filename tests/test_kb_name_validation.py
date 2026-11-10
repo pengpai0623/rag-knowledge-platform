@@ -69,15 +69,17 @@ def test_empty_allowed_only_when_explicit():
     _rejected("")
 
 
-def test_upload_rejects_bad_kb_name():
-    r = client.post(
-        "/api/rag/upload?knowledge_base=_bad",
-        files={"file": ("a.md", b"# hi", "text/markdown")},
-    )
-    body = r.json()
-    assert r.status_code == 200, r.text
-    assert body["code"] == 400, body
-    assert "知识库名不合法" in body["msg"]
+def test_upload_no_longer_takes_kb_name():
+    """上传的库名由内容决定（doc_<sha16>），调用方不再传库名/mode。
+
+    这条守的是契约本身：旧前端若还传 knowledge_base，FastAPI 会静默忽略，
+    不会因为名字非法而报 400——所以参数表里不能再出现它们。
+    """
+    params = client.get("/openapi.json").json()["paths"]["/api/rag/upload"]["post"]["parameters"]
+    names = {p["name"] for p in params}
+    assert "knowledge_base" not in names, names
+    assert "mode" not in names, names
+    assert names == {"clean_policy"}, names
 
 
 def test_chat_rejects_bad_kb_name():

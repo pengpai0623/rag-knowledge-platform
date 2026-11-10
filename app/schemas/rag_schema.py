@@ -2,14 +2,29 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 
+class SameSourceKnowledgeBase(BaseModel):
+    """与本次上传同文件名、但不是同一份内容的历史库（孤儿提示，不自动删除）。"""
+
+    name: str
+    knowledge_base_id: Optional[int] = None
+    chunk_count: int = 0
+
+
 class UploadResponse(BaseModel):
-    knowledge_base: str
+    knowledge_base: str                       # 后端生成：doc_<sha256 前 16 位>，不可修改
+    knowledge_base_id: Optional[int] = None   # 首次入库时生成，之后恒复用
     file_name: str
-    chunk_count: int
-    status: str                  # success / skipped
-    deleted_chunks: int = 0      # replace 模式下被覆盖删除的旧分片数
-    mode: str = "replace"
-    clean_policy: str = "full"   # 回显实际生效的清洗策略（传错位置时便于发现）
+    source: str = ""                          # 库内实际生效的来源名（改名重传时会被刷新）
+    chunk_count: int                          # 库内当前分片数（skipped 时是库里的真实值）
+    status: str                               # created / skipped / replaced
+    deleted_chunks: int = 0                   # replaced 时被删掉的旧分片数
+    # 以下四项回显「库里实际生效的值」，不是本次请求参数——传了 safe 却被 skipped 时才看得出来
+    clean_policy: str = "full"
+    cleaner_version: str = ""                 # 清洗实现代数（c1/c2…），与 clean_policy 分工不同
+    parser_version: str = ""
+    splitter_version: str = ""
+    reason: str = ""                          # 中文说明为什么是这个状态
+    same_source_kbs: List[SameSourceKnowledgeBase] = []
 
 
 class ChatRequest(BaseModel):
@@ -30,8 +45,10 @@ class ChatResponse(BaseModel):
 
 
 class KnowledgeBaseItem(BaseModel):
-    name: str
-    doc_count: int      # 去重后的来源文档数
+    name: str                                 # collection 名 doc_<sha16>
+    source: Optional[str] = None              # 这个库装的是哪份文件
+    knowledge_base_id: Optional[int] = None   # 业务侧主键，MySQL 接入后由它关联
+    doc_count: int      # 恒为 1（有分片）/ 0（空库），一个库只放一份文件
     chunk_count: int = 0  # 向量分片总数
 
 
@@ -43,7 +60,10 @@ class DeleteDocumentsResponse(BaseModel):
 
 class DeleteKnowledgeBaseResponse(BaseModel):
     knowledge_base: str
+    # 带回 kb_id：业务侧要按它删掉 MySQL 里的 knowledge_base 记录，否则会留下悬空行
+    knowledge_base_id: Optional[int] = None
     deleted_collections: int  # 1=已删除；0=本来就不存在（路由层会拦成 404 / code 2001）
+    deleted_chunks: int = 0   # 实际删掉的分片数
 
 
 class SourceItem(BaseModel):

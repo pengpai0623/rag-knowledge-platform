@@ -2,7 +2,9 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from typing import Literal, Optional
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
@@ -44,6 +46,7 @@ from app.services.retrieve_service import RetrieveService
 from app.services.generate_service import GenerateService
 from utils.logger import get_logger
 from utils.structural_splitter import SPLITTER_VERSION
+from utils.text_cleaner import CLEANER_VERSION
 from utils.universal_parser import PARSER_VERSION, UniversalDocParser
 
 router = APIRouter(prefix="/api/rag", tags=["RAG 知识库"])
@@ -81,16 +84,24 @@ def _ensure_valid_kb_name(knowledge_base: str, *, allow_empty: bool = False) -> 
     )
 
 
+# 同一个库的并发上传串行化（详见 upload_document）。
+# 键是 collection 名（内容 sha），条目数等于历史上传过的文件数，测试阶段可忽略；
+# 若将来文件量级很大，可以在释放时清理未被等待的锁。
+_upload_locks: dict = {}
+_upload_locks_guard = threading.Lock()
+
+
+@contextmanager
+def _upload_lock(knowledge_base: str):
+    """按库名加进程内互斥锁，只保护「判定 → 写入」这段临界区。"""
+    with _upload_locks_guard:
+        lock = _upload_locks.setdefault(knowledge_base, threading.Lock())
+    with lock:
+        yield
+
+
 @router.post("/upload", response_model=ApiResponse[UploadResponse], summary="文档上传入库")
 async def upload_document(
-    knowledge_base: str = "default",
-    mode: Literal["replace", "skip"] = Query(
-        "replace",
-        description=(
-            "replace=同来源覆盖写入（先写新分片再删旧分片）；"
-            "skip=库里已有同内容同解析版本(sha256+parser_version)则跳过"
-        ),
-    ),
     clean_policy: Literal["full", "safe", "raw"] = Query(
         "full",
         description=(
@@ -101,9 +112,14 @@ async def upload_document(
     ),
     file: UploadFile = File(..., description="待入库的文档文件"),
 ):
-    # 先校验库名再落盘：名字非法时没必要把几十 MB 文件写到磁盘再报错
-    _ensure_valid_kb_name(knowledge_base)
+    """上传 → 解析 → 清洗 → 分片 → 入库，由后端判定该不该写。
 
+    调用方不再传库名，也不再选 replace/skip：
+    - collection 名 = `doc_` + sha256(文件原始字节)[:16]，内容定名、不可修改；
+    - knowledge_base_id 在「库不存在」时由后端生成，库已存在则复用库里的值；
+    - 状态三选一，见 IndexService.decide_upload_status：
+      created=首次入库 / skipped=同内容同策略已入库 / replaced=同内容换了策略。
+    """
     # 校验文件格式
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in SUPPORTED_EXTENSIONS:
@@ -130,11 +146,10 @@ async def upload_document(
     # 先落一条开始日志：大文件解析可能几十秒，只有结束日志的话，中途卡住无从判断。
     # 超限时 total 只累加到刚过线，所以这里用 ≥ 语义（后面会单独报 413）。
     logger.info(
-        "上传开始 | kb=%s file=%s size=%s mode=%s policy=%s",
-        knowledge_base, file.filename,
-        f"{total / 1024 / 1024:.2f}MB" if total <= max_bytes
-        else f">{MAX_UPLOAD_MB}MB",
-        mode, clean_policy,
+        "上传开始 | file=%s size=%s policy=%s",
+        file.filename,
+        f"{total / 1024 / 1024:.2f}MB" if total <= max_bytes else f">{MAX_UPLOAD_MB}MB",
+        clean_policy,
     )
 
     try:
@@ -146,63 +161,118 @@ async def upload_document(
                 detail=f"文件超过 {MAX_UPLOAD_MB}MB 上限（当前 {total / 1024 / 1024:.1f}MB），请拆分后上传",
             )
 
-        sha256 = UniversalDocParser.file_sha256(tmp_path)
+        sha16 = UniversalDocParser.file_sha256(tmp_path)
+        knowledge_base = f"doc_{sha16}"
 
-        # 幂等（仅 skip 模式）：同内容 + 同解析版本 + 同清洗策略 + 同切分版本已入库，
-        # 则不重复写向量。这四项必须全带，否则任一策略变更后同一份文件永远无法重灌。
-        if mode == "skip" and IndexService.has_source(
-            knowledge_base, sha256, PARSER_VERSION, clean_policy, SPLITTER_VERSION
-        ):
-            # 跳过是「什么都没做」，必须留痕，否则前端看到 chunk_count=0 会怀疑上传失败
-            logger.info(
-                "上传跳过：同内容同解析版本已入库 | kb=%s file=%s policy=%s",
-                knowledge_base, file.filename, clean_policy,
-            )
-            return ok(UploadResponse(
-                knowledge_base=knowledge_base,
-                file_name=file.filename,
-                chunk_count=0,
-                status="skipped",
-                deleted_chunks=0,
-                mode=mode,
+        # 同一个库的并发上传串行化：两个请求同时判定为 created 会各生成一个 kb_id，
+        # 后写入的分片把前一个的 metadata 覆盖掉，同一个库里就会混着两个 kb_id。
+        # 单进程 + 进程内锁就够；将来多副本部署需要分布式锁或 MySQL 唯一键兜底。
+        with _upload_lock(knowledge_base):
+            profile = IndexService.collection_profile(knowledge_base)
+            status, reason = IndexService.decide_upload_status(
+                profile,
+                parser_version=PARSER_VERSION,
                 clean_policy=clean_policy,
-            ))
-
-        # 解析清洗分片；source 由解析层按原始文件名归一化，引用不会变成 tmpXXXX.md
-        splits = ParseService.parse_and_split(
-            tmp_path, source_name=file.filename, clean_policy=clean_policy
-        )
-        if not splits:
-            raise EmptyContentError(
-                "解析后没有可入库的内容（文档可能全为空白页）",
-                code=ERR_PARSE_EMPTY_CONTENT,
+                cleaner_version=CLEANER_VERSION,
+                splitter_version=SPLITTER_VERSION,
             )
 
-        source = str(splits[0].metadata.get("source") or file.filename)
+            if status == "skipped":
+                # 改名重传：内容没变 → skipped（不解析、不 re-embed），但源文件名要跟着刷新，
+                # 否则列表与引用里永远停在第一次入库时的名字。只改 metadata，不碰向量。
+                new_source = os.path.basename(file.filename or "")
+                stored_source = profile.get("source") or ""
+                if new_source and new_source != stored_source:
+                    refreshed = IndexService.update_source(knowledge_base, new_source)
+                    reason = (
+                        f"{reason}；来源名 {stored_source or '<未标记>'} → {new_source}"
+                        f"（已刷新 {refreshed} 个分片，未重算向量）"
+                    )
+                    logger.info(
+                        "上传跳过并刷新来源名 | kb=%s %s → %s 分片=%d",
+                        knowledge_base, stored_source, new_source, refreshed,
+                    )
+                # 跳过是「什么都没做」，必须留痕，否则前端看到 chunk_count 不为 0 会困惑
+                logger.info(
+                    "上传跳过 | kb=%s file=%s 分片=%d reason=%s",
+                    knowledge_base, file.filename, profile["chunk_count"], reason,
+                )
+                return ok(UploadResponse(
+                    knowledge_base=knowledge_base,
+                    knowledge_base_id=profile.get("knowledge_base_id"),
+                    file_name=file.filename,
+                    source=new_source or stored_source,
+                    chunk_count=profile["chunk_count"],
+                    status=status,
+                    deleted_chunks=0,
+                    # 回显库内实际生效的值，不是本次请求参数——否则「我传了 safe 却被跳过」
+                    # 在响应里看不出来
+                    clean_policy=profile.get("clean_policy") or clean_policy,
+                    cleaner_version=profile.get("cleaner_version") or CLEANER_VERSION,
+                    parser_version=profile.get("parser_version") or PARSER_VERSION,
+                    splitter_version=profile.get("splitter_version") or SPLITTER_VERSION,
+                    reason=reason,
+                ))
 
-        # 先写新分片、再删旧分片：写失败时旧数据仍完整（「先删后写」一失败就丢数据）
-        # 旧分片按「同 source 或同 sha256」匹配，改名重传也不会留下重复向量
-        old_ids = IndexService.source_chunk_ids(knowledge_base, source, sha256)
-        chunk_count = IndexService.add_documents(knowledge_base, splits)
-        deleted = IndexService.delete_ids(knowledge_base, old_ids)
+            if status == "replaced":
+                # 复用 kb_id：同一个业务知识库只是换了切片策略，不该换身份。
+                # 老数据可能没有 kb_id（v3 之前灌的），那时补一个新的。
+                knowledge_base_id = profile.get("knowledge_base_id") \
+                    or IndexService.next_knowledge_base_id()
+                # 先删后写：同库同内容，旧分片能从原文件重建；而「先写后删」中途失败
+                # 会让新旧策略的分片混在一个库里，下次判定命中新分片直接 skipped，
+                # 脏数据永久留着。删完失败则退化成空库，下次上传自动 created 重灌。
+                deleted = IndexService.delete_collection(knowledge_base)["chunk_count"]
+            else:
+                knowledge_base_id = IndexService.next_knowledge_base_id()
+                deleted = 0
+
+            # 解析清洗分片；source 由解析层按原始文件名归一化，引用不会变成 tmpXXXX.md
+            splits = ParseService.parse_and_split(
+                tmp_path, source_name=file.filename, clean_policy=clean_policy
+            )
+            if not splits:
+                raise EmptyContentError(
+                    "解析后没有可入库的内容（文档可能全为空白页）",
+                    code=ERR_PARSE_EMPTY_CONTENT,
+                )
+
+            chunk_count = IndexService.add_documents(
+                knowledge_base, splits, knowledge_base_id
+            )
+
+            # 新建库时顺手查一下「同文件名、不同内容」的历史库：内容一改就是新库新 ID，
+            # 旧库会变成孤儿。这里只提示不删（按文件名自动删会误伤别人的同名文件）。
+            same_source_kbs = []
+            if status == "created":
+                same_source_kbs = IndexService.collections_with_source(
+                    os.path.basename(file.filename or ""), exclude=knowledge_base
+                )
     finally:
         os.unlink(tmp_path)
 
     # 异常不再在路由层包装：DocumentParseError 等业务异常直接冒泡给全局 handler
-    # 一行收口整条上传链路（解析、清洗、分片、embedding、覆盖删除的耗时之和）
+    # 一行收口整条上传链路（解析、清洗、分片、embedding、旧库重建的耗时之和）
     logger.info(
-        "上传完成 | kb=%s file=%s 分片=%d 覆盖删除=%d | %.1fms",
-        knowledge_base, file.filename, chunk_count, deleted,
+        "上传完成 | status=%s kb=%s kb_id=%s file=%s 分片=%d 重建删除=%d 同名历史库=%d | %.1fms",
+        status, knowledge_base, knowledge_base_id, file.filename,
+        chunk_count, deleted, len(same_source_kbs),
         (time.perf_counter() - start) * 1000,
     )
     return ok(UploadResponse(
         knowledge_base=knowledge_base,
+        knowledge_base_id=knowledge_base_id,
         file_name=file.filename,
+        source=os.path.basename(file.filename or ""),
         chunk_count=chunk_count,
-        status="success",
+        status=status,
         deleted_chunks=deleted,
-        mode=mode,
         clean_policy=clean_policy,
+        cleaner_version=CLEANER_VERSION,
+        parser_version=PARSER_VERSION,
+        splitter_version=SPLITTER_VERSION,
+        reason=reason,
+        same_source_kbs=same_source_kbs,
     ))
 
 
@@ -317,14 +387,17 @@ async def preview_parse(
 @router.delete("/documents", response_model=ApiResponse[DeleteDocumentsResponse], summary="按来源删除向量")
 def delete_documents(knowledge_base: str, source: str):
     """删除某个知识库(collection)里指定来源文档的全部向量分片。
-        vector_db/chroma_rag_db/          ← 一个 Chroma 持久化目录（PERSIST_DIR）
-        ├── collection "default"          ← 知识库 default
-            ├── source "产品手册.pdf"               ← 文档（metadata.source）
-            │   ├── chunk 0..41                     ← 分片（真正的存储/检索单元）
-            ├── source "接口文档.md"
-            │   └── chunk 0..17
-        ├── collection "rag_knowledge_base" ← 知识库 rag_knowledge_base
-        └── collection "xxx"              ← 知识库 xxx
+
+        现在的层级是「一个 collection 就装一份文件」，所以这个接口基本等价于整库删除：
+
+        vector_db/chroma_rag_db/            ← 一个 Chroma 持久化目录（PERSIST_DIR）
+        ├── collection "doc_a3f9c2e1b7d4abcd"  ← 知识库，名字由内容 sha256 前 16 位决定
+        │   ├── source "产品手册.pdf"            ← 它装的那份文件（metadata.source）
+        │   └── chunk 0..11                     ← 分片（真正的存储/检索单元）
+        └── collection "doc_7b21e0c4d9a83315"  ← 另一份文件 = 另一个知识库
+
+    保留它是为了不破坏既有调用方；新前端直接用 DELETE /knowledge-bases/{name} 更准确
+    （那里还会带回 knowledge_base_id，便于同步删 MySQL 记录）。
 
     - 200 + code 2001：知识库不存在
     - 200 + deleted_chunks=0：没匹配到该来源（如实上报，不谎报成功）
@@ -349,15 +422,22 @@ def delete_documents(knowledge_base: str, source: str):
     summary="清空整个知识库",
 )
 def delete_knowledge_base(knowledge_base: str):
-    """整库删除(单个collection)。按 source 删只能清身份对得上的分片，解析策略升级需要整库重灌。"""
+    """整库删除（一个 collection 就是一份文件的内容）。
+
+    响应带回 knowledge_base_id：MySQL 接入后，业务侧要按这个 ID 删掉自己的
+    knowledge_base 记录，否则业务表里会留下指向空库的悬空行（顺序见
+    IndexService.delete_collection 的注释：先删 Chroma，再删 MySQL）。
+    """
     _ensure_valid_kb_name(knowledge_base)
     if not IndexService.has_collection(knowledge_base):
         raise KbNotFoundError(f"知识库不存在：{knowledge_base}", code=ERR_KB_NOT_FOUND)
     # 删除失败属于服务端故障：不再在路由层拼 500，交给兜底 handler（固定文案 + 日志留全量）
-    removed = IndexService.delete_collection(knowledge_base)
+    result = IndexService.delete_collection(knowledge_base)
     return ok(DeleteKnowledgeBaseResponse(
         knowledge_base=knowledge_base,
-        deleted_collections=1 if removed else 0,
+        knowledge_base_id=result["knowledge_base_id"],
+        deleted_collections=1 if result["deleted"] else 0,
+        deleted_chunks=result["chunk_count"],
     ))
 
 

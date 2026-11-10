@@ -1,8 +1,9 @@
 import errno
 import os
+import threading
 import time
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -34,6 +35,36 @@ PERSIST_DIR = os.environ.get("CHROMA_PERSIST_DIR") or os.path.join(
 _INSPECT_PAGE = 1000
 
 logger = get_logger("app.services.index_service")
+
+# knowledge_base_id 生成状态：毫秒时间戳 + 进程内严格递增。
+# 为什么不用 uuid/随机数：这个 ID 要写进 MySQL 当主键或业务 ID，单调递增才便于排查和排序。
+# 为什么不用数据库自增：MySQL 还没接，且上传链路不该依赖 DB 可用性。
+# 单进程部署下唯一性由「时间戳不倒退 + 锁内 +1」保证；多副本部署会撞，届时换 DB/Redis 序列。
+_ID_LOCK = threading.Lock()
+_last_kb_id = 0
+
+
+def _identity_fields(meta: dict) -> dict:
+    """从分片 metadata 里取「代表整库身份」的字段。
+
+    一个 collection 只有一份文件，所以任意一条分片就能代表整库；上传判定、
+    列表、巡检都读这一份，避免各写一遍导致字段漂移（比如某处漏了 kb_id）。
+
+    Chroma 只接受 str/int/float/bool，写进去是 int，读出来仍是 int；
+    MySQL 未接入时 kb_id 允许缺省，这里统一成 None，前端不用判 undefined。
+    """
+    kb_id = meta.get("knowledge_base_id")
+    return {
+        "source": meta.get("source"),
+        "file_sha256": meta.get("file_sha256"),
+        "knowledge_base_id": (
+            int(kb_id) if isinstance(kb_id, (int, float)) and not isinstance(kb_id, bool) else None
+        ),
+        "parser_version": meta.get("parser_version"),
+        "clean_policy": meta.get("clean_policy"),
+        "cleaner_version": meta.get("cleaner_version"),
+        "splitter_version": meta.get("splitter_version"),
+    }
 
 
 class IndexService:
@@ -72,8 +103,22 @@ class IndexService:
         )
 
     @classmethod
-    def add_documents(cls, knowledge_base: str, docs: List[Document]) -> int:
-        """文档批量入库，返回分片数量"""
+    def add_documents(
+        cls,
+        knowledge_base: str,
+        docs: List[Document],
+        knowledge_base_id: Optional[int] = None,
+    ) -> int:
+        """文档批量入库，返回分片数量。
+
+        knowledge_base_id 在这里统一注入、不在路由层注入：这是全项目唯一的写入口，
+        放在这里才能保证「只要进了库，分片一定带着业务 ID」，将来接 MySQL 或换
+        其它调用方都不会漏打。
+        """
+        if knowledge_base_id is not None:
+            for doc in docs:
+                doc.metadata["knowledge_base_id"] = knowledge_base_id
+
         start = time.perf_counter()
         with cls._guard(f"写入知识库 {knowledge_base}"):
             vector_store = cls.get_vector_store(knowledge_base)
@@ -84,6 +129,18 @@ class IndexService:
             knowledge_base, len(docs), (time.perf_counter() - start) * 1000,
         )
         return len(docs)
+
+    @classmethod
+    def next_knowledge_base_id(cls) -> int:
+        """生成一个新的 knowledge_base_id（毫秒时间戳，进程内严格递增）。
+
+        只在「库不存在」时生成；库已存在一律复用库里的值，所以同一份文件重复上传
+        不会堆出一串指向同一个 collection 的 ID。
+        """
+        global _last_kb_id
+        with _ID_LOCK:
+            _last_kb_id = max(int(time.time() * 1000), _last_kb_id + 1)
+            return _last_kb_id
 
     # ------------------------------------------------------- 异常翻译（唯一出口）
     @classmethod
@@ -189,12 +246,14 @@ class IndexService:
     def list_knowledge_bases(cls) -> List[dict]:
         """列出所有知识库。
 
-        约定：一个 Chroma collection 就是一个知识库，collection 名即接口里的 knowledge_base，
-        与 get_vector_store() 的入参保持一致。
+        约定：一个 Chroma collection 就是一个知识库，collection 名由文件内容决定
+        （`doc_<sha16>`），接口里对外就叫 knowledge_base，与 get_vector_store() 一致。
 
-        只读 collection 的统计信息与文档 metadata，不加载 Embedding 模型：
-        - doc_count  ：去重后的来源文档数（按 metadata.source 统计）
-        - chunk_count：该库的向量分片总数（collection.count() 是整个 collection 的记录数）
+        只读 collection 的统计信息与一条分片的 metadata，不加载 Embedding 模型：
+        - source / knowledge_base_id：这个库现在装的是哪份文件、属于哪个业务知识库
+        - doc_count  ：恒为 1（有分片）或 0（空库）。一个库只放一份文件，保留该字段
+                       是为了不破坏既有调用方
+        - chunk_count：该库的向量分片总数（collection.count()）
 
         单个库读失败不再「跳过并当成 0」：那是运维入口，宁可整页报错，
         也不要给出「库里少了一个」的错觉。
@@ -212,15 +271,156 @@ class IndexService:
                     continue
                 collection = client.get_collection(name)
                 chunk_count = collection.count()
-                metadatas = collection.get(include=["metadatas"])["metadatas"] or []
-                # 缺少 source 的旧数据统一归到未知来源，避免把"有内容"误报成 0 个文档
-                sources = {(m or {}).get("source") or "<未知来源>" for m in metadatas}
+                # 一个库一份文件：读一条就够，不必全量扫 metadata
+                meta = cls._first_metadata(collection) if chunk_count else {}
                 collections.append({
                     "name": name,
-                    "doc_count": len(sources) if metadatas else 0,
+                    **_identity_fields(meta),
+                    "doc_count": 1 if chunk_count else 0,
                     "chunk_count": chunk_count,
                 })
         return collections
+
+    @classmethod
+    def collection_profile(cls, knowledge_base: str) -> Optional[dict]:
+        """读一个 collection 的身份信息，不存在返回 None。
+
+        返回 source / file_sha256 / knowledge_base_id / parser_version / clean_policy /
+        cleaner_version / splitter_version / chunk_count。上传流程只靠这一次读取就能判定
+        created / skipped / replaced，不用再单独查一次「有没有同内容分片」。
+
+        取一条分片就够：一个 collection 只放一份文件。
+        """
+        if not cls.has_collection(knowledge_base):
+            return None
+        client = cls._persistent_client()
+        with cls._guard(f"读取 {knowledge_base} 的身份信息"):
+            collection = cls._collection(client, knowledge_base)
+            chunk_count = collection.count()
+            meta = cls._first_metadata(collection) if chunk_count else {}
+        return {
+            **_identity_fields(meta),
+            "chunk_count": chunk_count,
+        }
+
+    @staticmethod
+    def decide_upload_status(
+        profile: Optional[dict],
+        *,
+        parser_version: str,
+        clean_policy: str,
+        cleaner_version: str,
+        splitter_version: str,
+    ) -> Tuple[str, str]:
+        """判定本次上传该 created / skipped / replaced，返回 (状态, 原因)。
+
+        collection 名由内容 sha 决定，所以「库存在」本身就等价于「同一份内容」；
+        剩下只需要比四个策略维度（解析 / 清洗策略 / 清洗实现代数 / 切分）：
+
+        - 库不存在 / 空库   → created（空库是上次写入失败的残留，必须重灌，
+                                      否则会永久 skipped 而库里没有数据）
+        - 四项全一致        → skipped（不解析、不 embed，直接返回库里的 kb_id）
+        - 任一不一致        → replaced（复用 kb_id，整库重建）
+
+        clean_policy 与 cleaner_version 必须分开比：前者是用户选的档位（full/safe/raw），
+        后者是清洗代码的代数。只改 cleaner 实现不改档位名时，只看 clean_policy 会误判
+        成「同策略」而跳过，新清洗结果永远进不了库。
+
+        缺字段的老数据（v3 之前的解析、没有 splitter_version / cleaner_version）
+        一律判 replaced：宁可多算一次 embedding，也不要静默沿用旧策略的切片。
+        """
+        if not profile or not profile.get("chunk_count"):
+            return "created", "首次入库"
+
+        changes = []
+        for label, actual, expected in (
+            ("parser_version", profile.get("parser_version"), parser_version),
+            ("clean_policy", profile.get("clean_policy"), clean_policy),
+            ("cleaner_version", profile.get("cleaner_version"), cleaner_version),
+            ("splitter_version", profile.get("splitter_version"), splitter_version),
+        ):
+            if actual != expected:
+                changes.append(f"{label} {actual or '<未标记>'} → {expected}")
+        if changes:
+            return "replaced", "；".join(changes)
+        return "skipped", "同内容同策略已入库"
+
+    @classmethod
+    def collections_with_source(cls, source: str, exclude: str = "") -> List[dict]:
+        """列出与 source 同文件名、但不是 exclude 的其它库（历史版本库提示）。
+
+        内容一改 sha 就变，库名和 kb_id 都跟着变，旧库没人认领就成了孤儿。
+        这里**只做提示、不做删除**：按文件名自动删会误伤——两个部门各有一份
+        `报告.pdf` 时，删掉的是别人的库。真正的清理由业务侧调 DELETE 接口完成
+        （MySQL 接入后可以按 doc_key + revision 做对账）。
+        """
+        if not source or not os.path.exists(PERSIST_DIR):
+            return []
+
+        client = cls._persistent_client()
+        found: List[dict] = []
+        with cls._guard(f"查找与 {source} 同名的其它知识库"):
+            for item in client.list_collections():
+                name = getattr(item, "name", item)
+                if not isinstance(name, str) or name == exclude:
+                    continue
+                collection = client.get_collection(name)
+                chunk_count = collection.count()
+                if not chunk_count:
+                    continue
+                meta = cls._first_metadata(collection)
+                if (meta.get("source") or "") != source:
+                    continue
+                found.append({
+                    "name": name,
+                    "knowledge_base_id": _identity_fields(meta)["knowledge_base_id"],
+                    "chunk_count": chunk_count,
+                })
+        return found
+
+    @classmethod
+    def update_source(cls, knowledge_base: str, source: str) -> int:
+        """把库内所有分片的 `source` 刷成新的文件名，返回受影响分片数。
+
+        用途：同一份内容改名重传。上传判定只比「内容 + 策略」，源文件名不参与，
+        所以改名重传会走 skipped（不解析、不重算向量）；但如果不顺手刷 source，
+        引用展示和「按来源删除」会一直停在第一次入库时的名字。
+
+        只改 metadata 里这一个字段：文件没变、向量没变、kb_id 与各版本号都不动，
+        所以不是「重灌」，也不该触发 replaced。
+
+        Chroma 的 update 传完整 metadata（读出来改一个键再整体写回），
+        不依赖它对「部分字段是替换还是合并」的实现细节。
+        """
+        if not source or not cls.has_collection(knowledge_base):
+            return 0
+        client = cls._persistent_client()
+        with cls._guard(f"刷新 {knowledge_base} 的来源名"):
+            collection = cls._collection(client, knowledge_base)
+            page = collection.get(include=["metadatas"])
+            ids = page.get("ids") or []
+            metas = page.get("metadatas") or []
+            if not ids:
+                return 0
+            new_metas = []
+            for meta in metas:
+                item = dict(meta or {})
+                item["source"] = source
+                new_metas.append(item)
+            collection.update(ids=ids, metadatas=new_metas)
+        logger.info("来源名已刷新 | kb=%s 分片=%d source=%s", knowledge_base, len(ids), source)
+        return len(ids)
+
+    @staticmethod
+    def _first_metadata(collection) -> dict:
+        """取一条分片的 metadata 代表整库（一个 collection 只有一份文件）。
+
+        list_knowledge_bases / collection_profile / collections_with_source 都读它：
+        各自拼一遍的话，迟早出现「列表里有 kb_id、巡检里没有」这种漂移。
+        """
+        page = collection.get(limit=1, include=["metadatas"])
+        metas = page.get("metadatas") or []
+        return (metas[0] if metas else None) or {}
 
     @classmethod
     def inspect_collections(cls, knowledge_base: str = "") -> List[dict]:
@@ -306,107 +506,33 @@ class IndexService:
         return knowledge_base in names
 
     @classmethod
-    def has_source(
-        cls,
-        knowledge_base: str,
-        file_sha256: str,
-        parser_version: str,
-        clean_policy: str = "",
-        splitter_version: str = "",
-    ) -> bool:
-        """库里是否已存在「同内容 + 同解析版本 + 同清洗策略 + 同切分版本」的分片。
+    def delete_collection(cls, knowledge_base: str) -> dict:
+        """删除整个 collection，返回 {deleted, knowledge_base_id, chunk_count}。
 
-        必须带 parser_version：解析策略升级后（v1 → v2），同一份文件虽然 sha 相同，
-        但需要用新解析器重灌，不能因为「内容没变」就跳过。
-        同理必须带 clean_policy 与 splitter_version：换清洗策略或换切分逻辑后，
-        分片文本/边界完全不同，skip 掉就等于改动没生效。
-        v2/v3 之前的老数据没有这些字段，$eq 对缺失字段不匹配 → 不跳过、重新入库，
-        宁可多算一次 embedding，也不要静默沿用旧策略的切片。
-        只查一条记录，不拉全量 metadata。
-        """
-        if not file_sha256 or not cls.has_collection(knowledge_base):
-            return False
-        conditions = [
-            {"file_sha256": {"$eq": file_sha256}},
-            {"parser_version": {"$eq": parser_version}},
-        ]
-        if clean_policy:
-            conditions.append({"clean_policy": {"$eq": clean_policy}})
-        if splitter_version:
-            conditions.append({"splitter_version": {"$eq": splitter_version}})
-        client = cls._persistent_client()
-        with cls._guard(f"查询 {knowledge_base} 已入库内容"):
-            collection = cls._collection(client, knowledge_base)
-            result = collection.get(where={"$and": conditions}, limit=1)
-        return bool(result.get("ids"))
+        为什么要把 kb_id 带回来：MySQL 接入后，「删向量库」必须连带删掉业务侧的
+        knowledge_base 记录，否则业务表里会留下指向空库的悬空行。调用方拿这个
+        kb_id 去删记录，顺序必须是「先删 Chroma、再删 MySQL」——
+        Chroma 删除是幂等的，重试无害；反过来先删 MySQL 记录、Chroma 却失败了，
+        就会留下查不到归属的孤儿向量，检索还能命中、业务侧却不知道它属于谁。
 
-    @classmethod
-    def source_chunk_ids(
-        cls, knowledge_base: str, source: str, file_sha256: str = ""
-    ) -> list:
-        """列出待覆盖文档的旧分片 id（双身份：source 或 file_sha256，不分版本）。
-
-        用它做「先写后删」：先新增分片，成功后再按 id 精确删掉旧版本的，
-        写失败时旧数据仍完整，不像「先删后写」那样一失败就丢。
-
-        为什么除了 source 还要按 sha256 匹配：source 是文件名，改个名重传就变
-        （`报告.pdf` → `报告-最终版.pdf`），只认 source 会查不到旧 id，旧分片永久
-        残留，检索时同一段话被命中两次、doc_count 也多算一个文档。
-        v2 之前的老数据没有 file_sha256 字段，$eq 对缺失字段不匹配，自动被排除。
+        chunk_count 用于响应里如实上报「删掉了多少分片」（原来只能报 collection 个数）。
         """
         if not cls.has_collection(knowledge_base):
-            return []
-        conditions = [{"source": {"$eq": source}}]
-        if file_sha256:
-            conditions.append({"file_sha256": {"$eq": file_sha256}})
-        where = conditions[0] if len(conditions) == 1 else {"$or": conditions}
-        client = cls._persistent_client()
-        with cls._guard(f"读取 {knowledge_base}/{source} 的已入库分片"):
-            collection = cls._collection(client, knowledge_base)
-            result = collection.get(where=where, include=["metadatas"])
-        ids = list(result.get("ids") or [])
-        # 命中了别的来源，说明是「同内容改名重传」，删掉这些分片属预期行为，但要留痕
-        stale_sources = {
-            (m or {}).get("source")
-            for m in (result.get("metadatas") or [])
-        } - {source, None}
-        if stale_sources:
-            logger.warning(
-                "同内容旧分片将被覆盖：%s 命中其他来源 %s（共 %d 个分片）",
-                source, sorted(stale_sources), len(ids),
-            )
-        return ids
+            return {"deleted": False, "knowledge_base_id": None, "chunk_count": 0}
 
-    # ------------------------------------------------------------ 删除相关
-    @classmethod
-    def delete_ids(cls, knowledge_base: str, ids: list) -> int:
-        """按 id 删除分片，返回实际删除数量。
-
-        直接用 ids 长度，不再用 collection.count() 前后差：count() 数的是整个
-        collection 的记录数，并发删别的文档时两个请求会把对方的删除量算进自己头上。
-        """
-        if not ids:
-            return 0
-        client = cls._persistent_client()
-        with cls._guard(f"删除 {knowledge_base} 的旧分片"):
-            cls._collection(client, knowledge_base).delete(ids=ids)
-        return len(ids)
-
-    @classmethod
-    def delete_collection(cls, knowledge_base: str) -> bool:
-        """清空整个知识库，返回是否真的删掉了一个 collection。
-
-        必要性：按 source 删除只能清「身份对得上」的分片，解析策略升级后
-        需要整库重灌，没有清库入口就永远清不干净。
-        """
-        if not cls.has_collection(knowledge_base):
-            return False
         client = cls._persistent_client()
         with cls._guard(f"删除知识库 {knowledge_base}"):
+            collection = cls._collection(client, knowledge_base)
+            chunk_count = collection.count()
+            meta = cls._first_metadata(collection) if chunk_count else {}
+            kb_id = _identity_fields(meta)["knowledge_base_id"]
             client.delete_collection(knowledge_base)
-        # 破坏性操作留痕：事后追「这个库是谁什么时候清掉的」只能靠这行
-        logger.warning("整库删除 | kb=%s", knowledge_base)
-        return True
+        # 破坏性操作留痕：事后追「这个库是谁什么时候清掉的」只能靠这行，
+        # kb_id 一并记下，MySQL 接入后据此对账（业务表里不该再有这个 ID）
+        logger.warning(
+            "整库删除 | kb=%s kb_id=%s 分片=%d", knowledge_base, kb_id, chunk_count
+        )
+        return {"deleted": True, "knowledge_base_id": kb_id, "chunk_count": chunk_count}
 
     @classmethod
     def delete_by_source(cls, knowledge_base: str, source: str) -> int:

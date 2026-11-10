@@ -29,6 +29,17 @@ logger = get_logger("utils.text_cleaner")
 # 对外暴露的策略名（顺序即文档顺序，router 的 Literal 与此保持一致）
 CLEAN_POLICIES: Tuple[str, ...] = ("full", "safe", "raw")
 
+# 清洗逻辑的版本号：改了这里任何清洗规则（正则、全角转换、缩进处理、去重）就要 +1。
+#
+# 为什么策略名不够：clean_policy 只是 full/safe/raw 三个名字，改实现不改名字时，
+# 库里分片的 clean_policy 依旧相同，上传会被误判成「同策略」而跳过（skipped），
+# 新清洗结果永远进不了库。所以除了策略名，还要有「第几代实现」这个指纹。
+# 它写进每个分片的 metadata，并参与 decide_upload_status 的一致判定。
+#
+# 手工维护（不用文件内容哈希）：哈希会被注释、空行、CRLF/LF 换行影响，
+# Windows 开发 + Linux 部署下同一份代码指纹不同，会让同一文件换个环境就整库重灌。
+CLEANER_VERSION = "c1"
+
 
 @dataclass(frozen=True)
 class _Flags:
@@ -248,8 +259,9 @@ class TextCleaner:
                 new_metadata['source'] = new_metadata.get('source', '')
                 new_metadata['file_type'] = new_metadata.get('file_type', 'unknown').lower()
                 new_metadata['cleaned'] = True
-                # 参与 mode=skip 的幂等判断：换策略重传必须重新入库
+                # 参与幂等判断：换策略、或清洗实现换代（CLEANER_VERSION）都必须重新入库
                 new_metadata['clean_policy'] = self.policy
+                new_metadata['cleaner_version'] = CLEANER_VERSION
 
             cleaned_docs.append(Document(page_content=cleaned_content, metadata=new_metadata))
 

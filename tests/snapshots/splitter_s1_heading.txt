@@ -1,0 +1,21 @@
+strategy=heading chunks=5
+
+[chunk 0] chars=4 heading_path='产品手册' page_start=None page_end=None is_heading=None
+产品手册
+
+[chunk 1] chars=33 heading_path='产品手册 > 第一章 概述' page_start=None page_end=None is_heading=None
+第一章 概述
+本手册介绍产品的基本用法，包括安装、配置与常见问题。
+
+[chunk 2] chars=37 heading_path='产品手册 > 第二章 安装' page_start=None page_end=None is_heading=None
+第二章 安装
+安装步骤如下：先下载安装包，再双击运行，最后按提示完成配置。
+
+[chunk 3] chars=10 heading_path='产品手册 > 第二章 安装 > 2.1 环境要求' page_start=None page_end=None is_heading=None
+2.1 环境要求
+无
+
+[chunk 4] chars=35 heading_path='产品手册 > 附录 A 术语表' page_start=None page_end=None is_heading=None
+附录 A 术语表
+分片：把长文本切成检索单元。
+向量：文本的数值表示。

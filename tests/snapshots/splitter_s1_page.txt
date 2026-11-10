@@ -1,0 +1,17 @@
+strategy=page chunks=5
+
+[chunk 0] chars=2 heading_path='' page_start=1 page_end=1 is_heading=None
+封面
+
+[chunk 1] chars=85 heading_path='' page_start=2 page_end=2 is_heading=None
+本页正文用于验证按页分组之后的长度校形规则，内容本身没有业务含义，只需要足够长以触发递归切分。安装前请确认系统版本与磁盘空间，安装过程中请关闭杀毒软件并以管理员身份运行。
+
+[chunk 2] chars=9 heading_path='' page_start=3 page_end=4 is_heading=None
+第二章 隔页
+目录
+
+[chunk 3] chars=190 heading_path='' page_start=5 page_end=5 is_heading=None
+超长页的第一段，用来触发按页分组之后的递归切分与短尾合并。这一页的正文会被切分器按句号、逗号、空格由粗到细地切，切点应当落在语义边界上。超长页的第二段，继续堆叠字数，让这一页的总长度明显超过此时设置的 chunk_size。为了确保真的会触发递归切分，这里再多写几句：安装之前请确认系统版本、磁盘剩余空间，以及是否需要配置代理；安装过程中请关闭杀毒软件，并以管理员身份运行安装程序
+
+[chunk 4] chars=78 heading_path='' page_start=5 page_end=5 is_heading=None
+。超长页的第三段，用于观察切分点是否落在句号处而不是句子中间。超长页的第四段，再次堆叠一些字数，确保这一页切完之后还会剩下一个短尾片。超长页的第五段，结束。

@@ -1,0 +1,7 @@
+strategy=flat chunks=2
+
+[chunk 0] chars=116 heading_path='' page_start=None page_end=None is_heading=None
+第一段讲的是安装前的准备工作，需要确认操作系统版本、磁盘空间与网络连通性。第二段讲的是安装过程中的注意事项，包括关闭杀毒软件、以管理员身份运行安装程序。第三段讲的是安装完成后的验证步骤，打开终端执行命令，能看到版本号即表示安装成功。
+
+[chunk 1] chars=116 heading_path='' page_start=None page_end=None is_heading=None
+第一段讲的是安装前的准备工作，需要确认操作系统版本、磁盘空间与网络连通性。第二段讲的是安装过程中的注意事项，包括关闭杀毒软件、以管理员身份运行安装程序。第三段讲的是安装完成后的验证步骤，打开终端执行命令，能看到版本号即表示安装成功。
