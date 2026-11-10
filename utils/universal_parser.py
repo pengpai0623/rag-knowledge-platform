@@ -45,7 +45,7 @@ logger = get_logger("utils.universal_parser")
 # 解析器版本：解析策略变更时递增，用于识别库里哪些分片是旧策略产物。
 # v3：docx 改为按 body XML 顺序遍历（表格回到正文中的真实位置），
 #     产出顺序与 v2 不同，必须让旧数据重灌。
-PARSER_VERSION = "v3"
+PARSER_VERSION = "v4"
 
 # 非 PDF 类型 → (解析函数, parse_mode, fallback_chain, 中文类型名)
 _OFFICE_PARSERS = {

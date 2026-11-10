@@ -42,7 +42,7 @@ UPDATE = os.environ.get("UPDATE_SNAPSHOTS") == "1"
 # 快照文件名里的版本号：改版本常量时必须一起改这里，否则下面的守卫会失败
 CLEANER_SNAPSHOT_VER = "c1"
 SPLITTER_SNAPSHOT_VER = "s1"
-PARSER_SNAPSHOT_VER = "v3"
+PARSER_SNAPSHOT_VER = "v4"
 
 
 # ------------------------------------------------------------------ 快照读写
